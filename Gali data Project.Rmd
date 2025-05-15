@@ -1,0 +1,892 @@
+
+```{r}
+#TRANSFORM DATA FROM WIDE TO LONG
+# Load necessary libraries
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tidyverse)
+file_path <- "/Users/nene/Desktop/GALI_External_DataRelease_2020.xlsx"
+Gali_data <- read_excel(file_path, sheet = "Data")
+
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+df_long <- Gali_data %>%
+  mutate(across(everything(), as.character)) %>%
+  select(New_External_ID, participated, program_year, matches("^fu[1-4]")) %>%
+  pivot_longer(
+    cols = starts_with("fu"),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  mutate(
+    time = as.numeric(str_extract(name, "(?<=fu)[1-4]")),
+    variable = str_remove(name, "fu[1-4]"),
+    year = time + 2018
+  ) %>%
+  select(-name) %>%
+  filter(
+    !is.na(value),
+    value != "",
+    !str_detect(value, "^5+$")
+  )
+
+
+```
+
+
+
+```{r}
+# Create a "years_since_joining" variable (will be NA for non-accelerator ventures)
+df_long <- df_long %>%
+  mutate(
+    year = as.numeric(year),
+    program_year = as.numeric(program_year),  # convert this too
+    years_since_joining = ifelse(!is.na(program_year) & !is.na(year),
+                                 year - program_year,
+                                 NA_real_)
+  )
+
+
+
+# Add post_accelerator variable
+df_long <- df_long %>%
+  mutate(
+    post_accelerator = ifelse(participated == 1 & year >= program_year, TRUE, FALSE)
+  )
+
+# Step 1: Select just the ID and program_region from Gali_data
+region_data <- Gali_data %>%
+  select(New_External_ID, program_region)
+
+# Step 2: Join this with df_long using a left join
+df_region <- df_long %>%
+  left_join(region_data, by = "New_External_ID")
+
+```
+
+
+```{r}
+#  SAME BUT NEW Load libraries
+library(lme4)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+
+# --------------------------
+# 1. Data Preprocessing
+# --------------------------
+
+# Financial Performance Data
+df_perform <- df_region %>%
+  mutate(
+    fins_revenues_m1 = case_when(
+      variable == "fins_revenues_m1" ~ as.numeric(value),
+      TRUE ~ NA_real_
+    ),
+    wages = case_when(
+      variable == "fins_wages_m1" ~ as.numeric(value),
+      TRUE ~ NA_real_
+    ),
+    profit_category = case_when(
+      variable == "fins_profit_m1" & str_detect(value, "Negative ROI") ~ "loss",
+      variable == "fins_profit_m1" & str_detect(value, "Not applicable") ~ "NA",
+      variable == "fins_profit_m1" & str_detect(value, "Unsure") ~ "neutral",
+      variable == "fins_profit_m1" & str_detect(value, "0% - 5%|6% - 10%|11% - 15%|16% - 20%|More than 20%") ~ "profit",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Set levels explicitly
+df_perform$profit_category <- factor(df_perform$profit_category, levels = c("loss", "neutral", "profit"))
+
+# Employment Data
+df_emplo <- df_region %>%
+  mutate(
+    fulltime = case_when(variable == "fins_ft_employees_m1" ~ as.numeric(value), TRUE ~ NA_real_),
+    parttime = case_when(variable == "fins_pt_employees_m1" ~ as.numeric(value), TRUE ~ NA_real_)
+  ) %>%
+  filter(!is.na(fulltime) | !is.na(parttime)) %>%
+  group_by(New_External_ID) %>%
+  summarise(
+    fulltime = sum(fulltime, na.rm = TRUE),
+    parttime = sum(parttime, na.rm = TRUE),
+    FTE = fulltime + (parttime * 0.5),
+    program_region = first(program_region),
+    participated = first(participated),
+    years_since_joining = first(years_since_joining),
+    post_accelerator = first(post_accelerator),
+    year = first(year),
+    .groups = "drop"
+  )
+
+# Investment Data
+df_Invest <- df_region %>%
+  mutate(
+    Accel = case_when(variable == "inv_equityfrom_accelerators" ~ as.numeric(value), TRUE ~ NA_real_),
+    Venture = case_when(variable == "inv_equityfrom_venturecap" ~ as.numeric(value), TRUE ~ NA_real_),
+    Own = case_when(variable == "inv_ownmoney_m1" ~ as.numeric(value), TRUE ~ NA_real_),
+    Outequity = case_when(variable == "inv_outequity_m1" ~ as.numeric(value), TRUE ~ NA_real_),
+     Debt = case_when(
+      variable == "inv_totaldebt_m1" ~ suppressWarnings(as.numeric(value)),
+      TRUE ~ NA_real_
+    ),
+    Phil = case_when(
+      variable == "inv_philan_m1" ~ suppressWarnings(as.numeric(value)),
+      TRUE ~ NA_real_))
+
+   
+
+# --------------------------
+# 2. Regressions
+# --------------------------
+
+# Common function to relevel and log-transform
+prepare_data <- function(df, varname) {
+  df$program_region <- relevel(factor(df$program_region), ref = "North America")
+  df[[paste0("log_", varname)]] <- log(df[[varname]] + 1)
+  return(df)
+}
+
+# Revenue
+df_perform <- prepare_data(df_perform, "fins_revenues_m1")
+model_logREV <- lmer(log_fins_revenues_m1 ~ participated * post_accelerator + years_since_joining + program_region + (1 | New_External_ID), data = df_perform)
+
+
+
+# Wages
+df_perform <- prepare_data(df_perform, "wages")
+model_logWAG <- lmer(log_wages ~  participated * post_accelerator + years_since_joining + program_region + (1 | New_External_ID), data = df_perform)
+
+# Employees (linear, not mixed model)
+df_emplo$program_region <- relevel(factor(df_emplo$program_region), ref = "North America")
+model_logEMP1 <- lm(FTE ~  participated * post_accelerator + years_since_joining + program_region, data = df_emplo)
+
+# Venture (binary logistic)
+df_Invest$program_region <- relevel(factor(df_Invest$program_region), ref = "North America")
+df_Invest$Venture_bin <- as.numeric(as.character(df_Invest$Venture))
+model_glm_venture <- glm(Venture_bin ~  participated * post_accelerator + years_since_joining + program_region, data = df_Invest, family = binomial(link = "logit"))
+
+# Own Investment
+df_Invest <- prepare_data(df_Invest, "Own")
+model_logOWN <- lmer(log_Own ~  participated * post_accelerator + years_since_joining + program_region + (1 | New_External_ID), data = df_Invest)
+
+# Outequity
+df_Invest <- prepare_data(df_Invest, "Outequity")
+model_logOUT <- lmer(log_Outequity ~  participated * post_accelerator + years_since_joining + program_region + (1 | New_External_ID), data = df_Invest)
+
+# Debt
+df_Invest <- prepare_data(df_Invest, "Debt")
+model_logDEBT <- lmer(log_Debt ~  participated * post_accelerator + years_since_joining + program_region + (1 | New_External_ID), data = df_Invest)
+
+# Philanthropy
+df_Invest <- prepare_data(df_Invest, "Phil")
+model_logPhil <- lmer(log_Phil ~  participated * post_accelerator + years_since_joining + program_region + (1 | New_External_ID), data = df_Invest)
+
+
+# --------------------------
+# 3. View Summaries
+# --------------------------
+list(
+  Revenue = summary(model_logREV),
+  Wages = summary(model_logWAG),
+  Employees = summary(model_logEMP1),
+  Venture = summary(model_glm_venture),
+  Own_Money_Invested = summary(model_logOWN),
+  Outequity = summary(model_logOUT),
+  Debt = summary(model_logDEBT),
+  Philanthropy = summary(model_logPhil))
+ 
+
+```
+
+
+
+
+```{r}
+library(scales)  # Add this line
+
+
+ggplot(df_perform %>% 
+         filter(!is.na(years_since_joining),
+                !is.na(program_region),
+                str_to_lower(program_region) != "other"),  # Exclude "other"
+       aes(x = years_since_joining, y = fins_revenues_m1, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_continuous(labels = label_comma(), trans = "log10") +  # Log scale
+  labs(title = "Revenue in Dollars Since Joining (Participated vs Non-Participated)",
+       y = "Revenue",
+       x = "Years Since Joining (0 = join year, negative = before joining)",
+       color = "Participation Status") +
+  scale_color_manual(values = c("steelblue", "darkorange"),
+                     labels = c("Non-Participant", "Participant")) +
+  theme_minimal() +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+
+ggplot(df_perform %>% 
+         filter(!is.na(years_since_joining),
+                !is.na(program_region),
+                str_to_lower(program_region) != "other"),  # Exclude "other"
+       aes(x = years_since_joining, y = wages, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_continuous(labels = label_comma(), trans = "log10") +  # Log scale
+  labs(title = "Wages in Dollars Since Joining (Participated vs Non-Participated)",
+       y = "Wages",
+       x = "Years Since Joining (0 = join year, negative = before joining)",
+       color = "Participation Status") +
+  scale_color_manual(values = c("steelblue", "red"),
+                     labels = c("Non-Participant", "Participant")) +
+  theme_minimal() +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+
+```
+
+```{r}
+#You can create an approximate FTE column on your own table simply by multiplying your FT head‑count by 1.0 and your PT head‑count by your chosen weight (say 0.5), then summing. For example, in R (using dplyr) you could do:
+
+
+library(dplyr)
+library(tidyr)
+
+df_emplo <- df_region %>%
+  mutate(
+    fulltime = case_when(
+      variable == "fins_ft_employees_m1" ~ as.numeric(value),
+      TRUE ~ NA_real_
+    ),
+    parttime = case_when(
+      variable == "fins_pt_employees_m1" ~ as.numeric(value),
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  # Filter to keep rows where at least one is non-NA
+  filter(!is.na(fulltime) | !is.na(parttime)) %>%
+  
+  # Group and summarize
+  group_by(New_External_ID) %>%
+  summarise(
+    fulltime = sum(fulltime, na.rm = TRUE),
+    parttime = sum(parttime, na.rm = TRUE),
+    FTE = fulltime + (parttime * 0.5),
+    program_region = first(program_region),
+    participated = first(participated),
+    years_since_joining = first(years_since_joining),
+    post_accelerator = first(post_accelerator),
+    year = first(year),
+    .groups = "drop"
+  )
+
+ggplot(df_emplo %>% 
+         filter(!is.na(years_since_joining),
+                !is.na(program_region),
+                str_to_lower(program_region) != "other"),  # Exclude "other"
+       aes(x = years_since_joining, y = FTE, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_continuous(labels = label_comma(), trans = "log10") +  # Log scale
+  labs(title = "Empolyess Since Joining (Participated vs Non-Participated)",
+       y = "Empolyess",
+       x = "Years Since Joining (0 = join year, negative = before joining)",
+       color = "Participation Status") +
+  scale_color_manual(values = c("steelblue", "Purple"),
+                     labels = c("Non-Participant", "Participant")) +
+  theme_minimal() +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+
+```
+
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# Common filter
+filtered_df <- df_Invest %>%
+  filter(!is.na(years_since_joining),
+         !is.na(program_region),
+         str_to_lower(program_region) != "other")
+
+# Own Money Invested
+ggplot(filtered_df, aes(x = years_since_joining, y = Own, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(
+    title = "Own Money Invested in Dollars Since Joining (Participant vs Non-Participant)",
+    y = "Own Money Invested",
+    x = "Years Since Joining\n(0 = join year, negative = before joining)",
+    color = "Participation Status"
+  ) +
+  scale_color_manual(values = c("steelblue", "Orange"),
+                     labels = c("Non-Participant", "Participant")) +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+# Outequity Earned
+ggplot(filtered_df, aes(x = years_since_joining, y = Outequity, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(
+    title = "Outequity Earned in Dollars Since Joining (Participant vs Non-Participant)",
+    y = "Outequity Earned",
+    x = "Years Since Joining\n(0 = join year, negative = before joining)",
+    color = "Participation Status"
+  ) +
+  scale_color_manual(values = c("steelblue", "Purple"),
+                     labels = c("Non-Participant", "Participant")) +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+# Debt
+ggplot(filtered_df, aes(x = years_since_joining, y = Debt, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(
+    title = "Debt in Dollars Since Joining (Participant vs Non-Participant)",
+    y = "Debt",
+    x = "Years Since Joining\n(0 = join year, negative = before joining)",
+    color = "Participation Status"
+  ) +
+  scale_color_manual(values = c("steelblue", "red"),
+                     labels = c("Non-Participant", "Participant")) +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+# Philanthropy Earned (with facet by program_region)
+ggplot(filtered_df, aes(x = years_since_joining, y = Phil, color = factor(participated))) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(
+    title = "Philanthropy Earned in Dollars Since Joining (Participant vs Non-Participant)",
+    y = "Philanthropy Earned",
+    x = "Years Since Joining\n(0 = join year, negative = before joining)",
+    color = "Participation Status"
+  ) +
+  scale_color_manual(values = c("steelblue", "LightGreen"),
+                     labels = c("Non-Participant", "Participant")) +
+  theme_minimal() +
+  facet_wrap(~ program_region, scales = "free_y") +
+  theme(
+    strip.text = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+   
+
+```
+
+
+```{r}
+# Load packages (make sure kableExtra is loaded *after* flextable so its footnote() is the one used)
+library(dplyr)
+library(tibble)
+library(lme4)
+library(knitr)
+library(flextable)
+library(kableExtra)
+
+# 1. Gather your models
+models <- list(
+  Revenue             = model_logREV,
+  Wages               = model_logWAG,
+  Employees           = model_logEMP1,
+  Venture             = model_glm_venture,
+  Own_Money_Invested  = model_logOWN,
+  `Out Equity`        = model_logOUT,
+  Debt                = model_logDEBT,
+  Philanthropy        = model_logPhil
+)
+
+# 2. Specify variables and labels (in the order you want them shown)
+vars <- c(
+  "participated1",
+  "years_since_joining",
+  "program_regionLatin America & Caribbean",
+  "program_regionOther",
+  "program_regionSouth Asia",
+  "program_regionSub-Saharan Africa",
+  "(Intercept)"
+)
+row_name <- c(
+  "Participated",
+  "Years Since Joining",
+  "Region: LAC",
+  "Region: Other",
+  "Region: South Asia",
+  "Region: Sub-Saharan Africa",
+  "Intercept"
+)
+
+# 3. Cell‐formatting function (handles glm vs. lmer objects, large coefficients, and p‐value/ t‐value stars)
+format_cell <- function(m, v) {
+  s <- summary(m)$coefficients
+  if ("Pr(>|z|)" %in% colnames(s)) {
+    est   <- s[v, "Estimate"]
+    se    <- s[v, "Std. Error"]
+    pval  <- s[v, "Pr(>|z|)"]
+    stars <- ifelse(pval < .001, "***",
+             ifelse(pval < .01,  "**",
+             ifelse(pval < .05,  "*",  "")))
+  } else {
+    est   <- s[v, "Estimate"]
+    se    <- s[v, "Std. Error"]
+    tstat <- s[v, "t value"]
+    stars <- ifelse(abs(tstat) > 2.576, "***",
+             ifelse(abs(tstat) > 1.96,  "**",
+             ifelse(abs(tstat) > 1.645, "*", "")))
+  }
+  # Format big numbers with commas, small with 3 decimals
+  if (abs(est) > 1000) {
+    est_str <- format(round(est), big.mark = ",")
+    se_str  <- format(round(se), big.mark = ",")
+  } else {
+    est_str <- format(round(est, 3), nsmall = 3)
+    se_str  <- format(round(se, 3), nsmall = 3)
+  }
+  paste0(est_str, stars, " (", se_str, ")")
+}
+
+# 4. Build the main body
+body <- lapply(models, function(m) {
+  vapply(vars, function(v) {
+    if (v %in% rownames(summary(m)$coefficients)) {
+      format_cell(m, v)
+    } else {
+      ""
+    }
+  }, character(1))
+}) %>%
+  do.call(cbind, .) %>%
+  as.data.frame(stringsAsFactors = FALSE)
+colnames(body) <- names(models)
+body <- cbind(Variable = row_name, body)
+
+# 5. Append footer rows (observations, groups for mixed models, AIC/REML)
+obs    <- sapply(models, nobs)
+groups <- sapply(models, function(m) {
+  if ("lmerMod" %in% class(m)) length(ranef(m)[[1]]) else NA
+})
+crit   <- sapply(models, function(m) {
+  if     ("lmerMod" %in% class(m)) paste0("REML=", format(round(AIC(m)), big.mark = ","))
+  else if ("glm"    %in% class(m)) paste0("AIC=",  format(round(AIC(m), 1), big.mark = ","))
+  else NA
+})
+footer <- rbind(
+  Observations  = obs,
+  `Groups (ID)` = groups,
+  `REML/AIC`    = crit
+) %>%
+  as.data.frame(stringsAsFactors = FALSE) %>%
+  tibble::rownames_to_column("Variable")
+
+# 6. Stack body + footer
+tbl <- bind_rows(body, footer)
+
+# 7. Render with kable + namespaced footnote()
+kable(
+  tbl,
+  row.names = FALSE,
+  align    = c("l", rep("c", ncol(tbl)-1)),
+  caption  = "Table 2: Estimated Effects of Accelerator Programs on Organizational Growth Indicators",
+  booktabs = TRUE
+) %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::footnote(
+    general           = "*** p < 0.001, ** p < 0.01, * p < 0.05",
+    general_title     = "",
+    footnote_as_chunk = TRUE,
+    threeparttable    = TRUE
+  )
+
+
+
+
+
+
+```
+
+
+
+```{r}
+# 5. Append only the 'Observations' footer row (no Groups, no REML/AIC)
+# 5. Append only the 'Observations' footer row (convert to character to match body)
+obs <- sapply(models, nobs)
+footer <- rbind(
+  Observations = obs
+) %>%
+  as.data.frame(stringsAsFactors = FALSE) %>%
+  tibble::rownames_to_column("Variable") %>%
+  mutate(across(-Variable, as.character))
+
+
+# 6. Stack body + footer
+tbl <- bind_rows(body, footer)
+
+# 6.1 Rename "Venture" to "VC Transition" in column names
+colnames(tbl) <- sub("^Venture$", "Equity from VCs ", colnames(tbl))
+
+# 7. Render with kable + namespaced footnote()
+kable(
+  tbl,
+  row.names = FALSE,
+  align    = c("l", rep("c", ncol(tbl)-1)),
+  caption  = "Table 2: Estimated Effects of Accelerator Programs on Organizational Growth Indicators",
+  booktabs = TRUE
+) %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::footnote(
+    general           = "*** p < 0.001, ** p < 0.01, * p < 0.05",
+    general_title     = "",
+    footnote_as_chunk = TRUE,
+    threeparttable    = TRUE
+  )
+
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+#Summary stats of the whole code: Using psych for detailed descriptive statistics for a clean metrics like mean, standard deviation, skewness, and kurtosis.
+library(psych)
+describe(Gali_data)
+library(dplyr)
+
+# Perform t-test by year, region, and participation group on Gali_data
+t_test_results <- Gali_data %>%
+  filter(
+    program_year >= 2013 & program_year <= 2019,
+    program_region %in% c("Latin America & Caribbean", "North America", "Sub-Saharan Africa", "South Asia")
+  ) %>%
+  pivot_longer(
+    cols = where(is.numeric) & !c("participated", "program_year"),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(program_year, program_region, variable) %>%
+  do({
+    if(length(unique(.$participated)) == 2) {
+      var_0 <- var(.$value[.$participated == 0], na.rm = TRUE)
+      var_1 <- var(.$value[.$participated == 1], na.rm = TRUE)
+      
+      if(!is.na(var_0) & !is.na(var_1) & var_0 > 0 & var_1 > 0) {
+        t_test_result <- t.test(value ~ participated, data = .)
+        data.frame(
+          program_year = unique(.$program_year),
+          program_region = unique(.$program_region),
+          variable = unique(.$variable),
+          t_statistic = t_test_result$statistic,
+          df = t_test_result$parameter,
+          p_value = t_test_result$p.value,
+          conf_low = t_test_result$conf.int[1],
+          conf_high = t_test_result$conf.int[2]
+        )
+      } else {
+        data.frame(
+          program_year = unique(.$program_year),
+          program_region = unique(.$program_region),
+          variable = unique(.$variable),
+          t_statistic = NA, df = NA, p_value = NA, conf_low = NA, conf_high = NA
+        )
+      }
+    } else {
+      data.frame(
+        program_year = unique(.$program_year),
+        program_region = unique(.$program_region),
+        variable = unique(.$variable),
+        t_statistic = NA, df = NA, p_value = NA, conf_low = NA, conf_high = NA
+      )
+    }
+  }) %>%
+  ungroup()
+
+# View the results
+View(t_test_results)
+
+
+
+
+
+```
+
+
+
+```{r}
+# Compute descriptive statistics
+library(psych)
+describe(Gali_data)
+library(dplyr)
+desc_stats <- describe(Gali_data) %>%
+  tibble::rownames_to_column("variable") %>%  # Convert row names to column for merging
+  select(variable, n, mean, sd, median, min, max, skew, kurtosis, se)  # Select relevant stats
+
+# Merge descriptive statistics with t-test results
+combined_results <- t_test_results %>%
+  left_join(desc_stats, by = "variable")
+
+# View the combined results
+View(combined_results)
+
+library(writexl)  # For saving as Excel
+library(readr)    # For saving as CSV
+
+write.csv(combined_results, file = "~/Desktop/combined_results3.csv")
+
+
+
+```
+
+
+
+```{r}
+library(psych)
+library(dplyr)
+library(tidyr)
+
+
+desc_stats <- Gali_data %>%
+  filter(
+    program_year >= 2013 & program_year <= 2019,
+    program_region %in% c("Latin America & Caribbean", "North America", "Sub-Saharan Africa", "South Asia","Other")
+  ) %>%
+  select(where(is.numeric), program_year, program_region) %>%
+  pivot_longer(
+    cols = -c(program_year, program_region),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(program_year, program_region, variable) %>%
+  filter(!all(is.na(value))) %>%
+  summarise(
+    n = round(sum(!is.na(value)), 3),
+    mean = round(mean(value, na.rm = TRUE), 3),
+    sd = round(sd(value, na.rm = TRUE), 3),
+    median = round(median(value, na.rm = TRUE), 3),
+    min = round(min(value, na.rm = TRUE), 3),
+    max = round(max(value, na.rm = TRUE), 3),
+    skew = round(psych::skew(value, na.rm = TRUE), 3),
+    kurtosis = round(psych::kurtosi(value, na.rm = TRUE), 3),
+    se = round(sd(value, na.rm = TRUE) / sqrt(sum(!is.na(value))), 3),
+    .groups = "drop"
+  )
+
+```
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+
+# Define group labels and custom order
+group_labels <- c(
+  "participated" = "Accelerated",
+  "2013 (0/1)" = "Application year", "2014 (0/1)" = "Application year", 
+  "2015 (0/1)" = "Application year", "2016 (0/1)" = "Application year",
+  "2017 (0/1)" = "Application year", "2018 (0/1)" = "Application year",
+  "2019 (0/1)" = "Application year",
+  "impact_area_agprod" = "Operating sector",
+  "impact_area_health" = "Operating sector",
+  "impact_area_fueleff" = "Operating sector",
+  "impact_area_other" = "Operating sector",
+  "found_name1_education" = "Team education",
+  "model_has_copyrights" = "Intellectual capital",
+  "model_has_patents" = "Intellectual capital",
+  "model_has_trademarks" = "Intellectual capital",
+  "report_any_prior_accelerator" = "Prior accelerator experience",
+  "found_name1_gender" = "Team gender composition",
+  "found_name2_gender" = "Team gender composition",
+  "found_name3_gender" = "Team gender composition",
+  "inv_hasequity" = "Traction", "inv_hasdebt" = "Traction", "inv_hasphilan" = "Traction",
+  "fins_ft_employees_m1" = "Traction", "fins_revenues_m1" = "Traction",
+  "fins_profit_m1" = "Traction", "fins_pt_employees_m1" = "Traction",
+  "Latin America & Caribbean (0/1)" = "Program region",
+  "North America (0/1)" = "Program region", "South Asia (0/1)" = "Program region",
+  "Sub-Saharan Africa (0/1)" = "Program region", "Others (0/1)" = "Program region"
+)
+
+variable_order <- c(
+  "participated",
+  "2013 (0/1)", "2014 (0/1)", "2015 (0/1)", "2016 (0/1)", "2017 (0/1)", "2018 (0/1)", "2019 (0/1)",
+  "impact_area_agprod", "impact_area_health", "impact_area_fueleff", "impact_area_other",
+  "found_name1_education",
+  "model_has_copyrights", "model_has_patents", "model_has_trademarks",
+  "report_any_prior_accelerator",
+  "found_name1_gender", "found_name2_gender", "found_name3_gender",
+  "inv_hasequity", "inv_hasdebt", "inv_hasphilan",
+  "fins_ft_employees_m1", "fins_revenues_m1", "fins_profit_m1", "fins_pt_employees_m1",
+  "Latin America & Caribbean (0/1)", "North America (0/1)", "South Asia (0/1)",
+  "Sub-Saharan Africa (0/1)", "Others (0/1)"
+)
+
+# Combine and organize the data
+summary_output <- bind_rows(dummy_summary, non_dummy_summary) %>%
+  mutate(
+    Description = ifelse(variable %in% var_list,
+                         var_desc[match(variable, var_list)],
+                         variable),
+    Group = group_labels[variable],
+    variable = factor(variable, levels = variable_order)
+  ) %>%
+  arrange(Group, variable) %>%
+  group_by(Group) %>%
+  mutate(Group = ifelse(row_number() == 1, Group, NA)) %>%  # Keep group name only for the first row in each group
+  ungroup() %>%
+  fill(Group, .direction = "down") %>%  # Fill group names down for other rows
+  select(Group, variable, Description, N, Mean, SD)
+
+# Create the table with grouped headers
+summary_output %>%
+  kable(caption = "Descriptive Statistics of Selected Variables", format = "markdown") %>%
+  kable_styling(full_width = FALSE, 
+                font_size = 12) %>%
+  column_spec(1, width = "3cm")  # Adjust the width of the first column to fit the group names
+
+
+```
+
+
+
+participated	Indicates ventures that finished the full program
+program_region	Region (World Bank definition) where the accelerator program took place
+program_year	Program year
+model_has_patents	Have patents	Whether assigned by an owner or obtained in some other way, does your venture have any of the following? (check all that apply) - Patents
+model_has_trademarks	Have trademarks	Whether assigned by an owner or obtained in some other way, does your venture have any of the following? (check all that apply) - Trademarks
+model_has_copyrights	Have copyrights	Whether assigned by an owner or obtained in some other way, does your venture have any of the following? (check all that apply) - Copyrights
+inv_hasdebt	Venture has debt	Please indicate whether your venture has received any of the / following investments from outside s...-Debt (not including any personal debt obtained on behalf of the business)
+inv_hasequity	Venture has equity	Please indicate whether your venture has received any of the / following investments from outside s...-Equity (equity investment is money received in return for some portion of ownership)
+inv_hasphilan	Venture has philanthropy	Please indicate whether your venture has received any of the / following investments from outside s...-Philanthropy (e.g., seed grants, awards, or donations)
+impact_area_health	Impact area: Health improvement	Which of the following impact objectives does your venture currently seek to address? (check up to three) - Health improvement
+impact_area_agprod	Impact area: Agriculture productivity	Which of the following impact objectives does your venture currently seek to address? (check up to three) - Agriculture productivity
+impact_area_information	Impact area: Access to information	Which of the following impact objectives does your venture / currently seek to address? (check up t...-Access to information
+impact_area_other	Impact area: Other	Which of the following impact objectives does your venture currently seek to address? (check up to three) - Other
+fins_ft_employees_m1	Number of full time employees in Year t-1	Not counting founders, on December 31, ${e://Field/yearm1}, how many people worked / for your venture?  /  /  (please exclude contract workers /  who are not on the business' official payroll)-Full-time employees
+fins_profit_m1	Profit margin in Year t-1	Profit is the business' income after all expenses and taxes have / been deducted. Roughly speaking, what was your venture's profit / margin (as a percentage of total investment) for calendar year ${e://Field/yearm1}? 
+fins_pt_employees_m1	Number of part time employees	Not counting founders, on December 31, ${e://Field/yearm1}, how many people worked / for your venture?  /  /  (please exclude contract workers /  who are not on the business' official payroll)-Part-time employees
+fins_revenues_m1	Revenue in Year t-1	What was your venture's total earned revenue: /  (please do not include any /  philanthropic investments or donations in this /  amount)-in calendar year ${e://Field/yearm1}? ($US)
+found_name1_education	Founder 1 highest level of education completed	Now, please provide the following information about each of the three founders listed above: - Founder 1 Highest Level of Education Completed
+found_name1_gender	Founder 1 gender	Now, please provide the following information about each of the three founders listed above: - Founder 1 Gender
+found_name2_education	Founder 2 highest level of education completed	Now, please provide the following information about each of the three founders listed above: - Founder 2 Highest Level of Education Completed
+found_name2_gender	Founder 2 gender	Now, please provide the following information about each of the three founders listed above: - Founder 2 Gender
+
+found_name3_education	Founder 3 highest level of education completed	Now, please provide the following information about each of the three founders listed above: - Founder 3 Highest Level of Education Completed
+
+
+```{r}
+# Summarize and filter top 15 most valuable variables from combined_results
+# Identify top 15 variables by average absolute t-statistic
+
+# Step 1: Filter combined results to only include rows where p_value < 0.05
+significant_data <- combined_results %>%
+  filter(!is.na(t_statistic), p_value < 0.05)  # Keep only rows with p_value < 0.05
+
+# Step 2: Get the list of variables that are statistically significant
+significant_vars <- significant_data %>%
+  group_by(variable) %>%
+  summarise(
+    avg_abs_t = mean(abs(t_statistic), na.rm = TRUE),
+    avg_p_value = mean(p_value, na.rm = TRUE),
+    n_years_significant = n()
+  ) %>%
+  arrange(desc(avg_abs_t)) %>%
+  pull(variable)
+
+# Step 3: Filter the original data to only include significant variables
+top_combined_results <- significant_data %>%
+  filter(variable %in% significant_vars)
+
+# View results
+View(top_combined_results)
+
+
+top_results_table <- top_combined_results %>%
+  filter(variable %in% significant_vars[1:10]) %>%  # Optional: top 10 variables based on T-statistic
+  group_by(program_year) %>%  # Group by year
+  slice_max(order_by = abs(t_statistic), n = 2) %>%  # Select the top 2 variables by absolute t-statistic
+  rename(
+    "Variable" = variable,
+    "Year" = program_year,
+    "T-Statistic" = t_statistic,
+    "P-Value" = p_value,
+    "Mean" = mean,
+    "SD" = sd
+  ) %>%
+  mutate(`P-Value` = round(`P-Value`, 3)) %>%  # Round p-values
+  select(Year, Variable, `T-Statistic`, `P-Value`, Mean, SD, n)  # Select relevant columns
+
+
+
+# Make sure you have kableExtra installed
+library(knitr)
+library(kableExtra)
+
+# Create the table
+kable(top_results_table, format = "markdown", digits = 3, caption = " Table 1: Top 2 Most Statistically Significant Gali Variables Per Year") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE) %>%  # Bold Year column
+  column_spec(2, bold = TRUE) %>%  # Bold Variable column
+  column_spec(3, color = "red") %>%  # Highlight T-Statistic in red (just as an example)
+  column_spec(4, color = "blue") %>%  # Highlight P-Value in blue
+  row_spec(0, bold = TRUE, background = "lightgray")  # Bold headers and light gray background for header row
+
+```
+
+
